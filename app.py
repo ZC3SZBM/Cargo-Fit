@@ -2,12 +2,10 @@ import streamlit as st
 import pandas as pd
 import io
 import os
-
 # =====================================================
 # PAGE CONFIG
 # =====================================================
 st.set_page_config(page_title="SmartPack - Container Load Planner", layout="wide")
-
 # =====================================================
 # GLOBAL CSS (FONT + COLORS)
 # =====================================================
@@ -37,27 +35,22 @@ label {
 }
 </style>
 """, unsafe_allow_html=True)
-
 # =====================================================
 # HEADER
 # =====================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGO_PATH = os.path.join(BASE_DIR, "john_deere_logo.png")
-
 col1, col2, col3 = st.columns([1.5, 4, 2])
-
 with col1:
     if os.path.exists(LOGO_PATH):
         st.image(LOGO_PATH, width=140)
     else:
         st.markdown("<h4 style='color:#367C2B;'>John Deere</h4>", unsafe_allow_html=True)
-
 with col2:
     st.markdown(
         "<h1 style='text-align:center;'>🚚 SmartPack - Container Load Planner</h1>",
         unsafe_allow_html=True
     )
-
 with col3:
     st.markdown(
         "<div style='text-align:right; font-weight:600; padding-top:22px;'>"
@@ -66,9 +59,7 @@ with col3:
         "</div>",
         unsafe_allow_html=True
     )
-
 st.markdown("---")
-
 # =====================================================
 # CONTAINERS
 # =====================================================
@@ -77,7 +68,6 @@ CONTAINERS = {
     "20 HC": {"L": 5898, "W": 2286, "H": 2540, "MAX_WT": 18000},
     "53 Dry Van": {"L": 16002, "W": 2286, "H": 2590, "MAX_WT": 18000},
 }
-
 DISPLAY_COLUMNS = [
     "Rack / Finished Good",
     "Quantity",
@@ -86,17 +76,14 @@ DISPLAY_COLUMNS = [
     "Height (MM)",
     "Weight (Kg)",
 ]
-
 # =====================================================
 # MAXRECTS GEOMETRY
 # =====================================================
 class Rect:
     def __init__(self, x, y, w, h):
         self.x, self.y, self.w, self.h = x, y, w, h
-
     def fits(self, w, h):
         return w <= self.w and h <= self.h
-
     def split(self, w, h):
         parts = []
         if self.w - w > 0:
@@ -104,12 +91,9 @@ class Rect:
         if self.h - h > 0:
             parts.append(Rect(self.x, self.y + h, self.w, self.h - h))
         return parts
-
-
 class MaxRectsBin:
     def __init__(self, w, h):
         self.free = [Rect(0, 0, w, h)]
-
     def place(self, w, h):
         best = None
         best_score = None
@@ -126,94 +110,130 @@ class MaxRectsBin:
         self.free.remove(fr)
         self.free.extend(fr.split(pw, ph))
         return True
-
 # =====================================================
 # PACKING ENGINE (UNCHANGED)
 # =====================================================
 def pack_containers_exact(df, container):
-    remaining_qty = {
-        r["Rack / Finished Good"]: int(r["Quantity"])
-        for _, r in df.iterrows()
-    }
-
-    rack_dims = {
-        r["Rack / Finished Good"]: (
-            int(r["Length (MM)"]),
-            int(r["Width (MM)"]),
-            int(r["Height (MM)"]),
-            float(r["Weight (Kg)"]),
-        )
-        for _, r in df.iterrows()
-    }
-
+    remaining = dict(zip(df["Rack / Finished Good"], df["Quantity"]))
+    dims = df.set_index("Rack / Finished Good").to_dict("index")
     containers = []
-
-    while any(q > 0 for q in remaining_qty.values()):
+    while any(v > 0 for v in remaining.values()):
+        racks = [r for r in remaining if remaining[r] > 0]
+        best_pair = None
+        best_score = 0
+        # =====================================================
+        # ✅ STEP 1: FIND BEST LANE PAIR (NOT FIRST, BEST)
+        # =====================================================
+        for i in range(len(racks)):
+            for j in range(i + 1, len(racks)):
+                r1, r2 = racks[i], racks[j]
+                w1 = dims[r1]["Width (MM)"]
+                w2 = dims[r2]["Width (MM)"]
+                if abs((w1 + w2) - container["W"]) < 5:
+                    def lane_capacity(r):
+                        l = dims[r]["Length (MM)"]
+                        h = dims[r]["Height (MM)"]
+                        wt = dims[r]["Weight (Kg)"]
+                        L_fit = int(container["L"] // l)
+                        H_fit = int(container["H"] // h)
+                        cap = L_fit * H_fit
+                        cap = min(cap, remaining[r])
+                        if wt == 0:
+                            return cap
+                        weight_cap = int(container["MAX_WT"] // wt)
+                        return min(cap, weight_cap)
+                    q1 = lane_capacity(r1)
+                    q2 = lane_capacity(r2)
+                    score = q1 + q2
+                    if score > best_score:
+                        best_score = score
+                        best_pair = (r1, q1, r2, q2)
+        # =====================================================
+        # ✅ STEP 2: APPLY BEST LANE IF FOUND
+        # =====================================================
+        if best_pair:
+            r1, q1, r2, q2 = best_pair
+            load = {}
+            if q1 > 0:
+                load[r1] = q1
+                remaining[r1] -= q1
+            if q2 > 0:
+                load[r2] = q2
+                remaining[r2] -= q2
+            containers.append(load)
+            continue
+        # =====================================================
+        # ✅ STEP 3: SHARED MAXRECTS (PHYSICALLY CORRECT)
+        # =====================================================
         bin = MaxRectsBin(container["L"], container["W"])
         load = {}
-        current_weight = 0.0
-        placed_any = False
-
+        used_weight = 0
         order = sorted(
-            remaining_qty.keys(),
-            key=lambda k: rack_dims[k][0] * rack_dims[k][1],
+            racks,
+            key=lambda r: dims[r]["Length (MM)"] * dims[r]["Width (MM)"],
             reverse=True
         )
-
-        for rack in order:
-            qty_left = remaining_qty[rack]
-            if qty_left <= 0:
+        for r in order:
+            qty = remaining[r]
+            if qty <= 0:
                 continue
-
-            l, w, h, wt = rack_dims[rack]
-            stack = container["H"] // h
-            if stack <= 0:
-                continue
-
-            while qty_left > 0:
+            l = dims[r]["Length (MM)"]
+            w = dims[r]["Width (MM)"]
+            h = dims[r]["Height (MM)"]
+            wt = dims[r]["Weight (Kg)"]
+            stack = int(container["H"] // h)
+            while qty > 0:
                 if not bin.place(l, w):
                     break
-
-                add = min(stack, qty_left)
-                if current_weight + (add * wt) > container["MAX_WT"]:
+                add = min(stack, qty)
+                if used_weight + add * wt > container["MAX_WT"]:
                     break
-
-                load[rack] = load.get(rack, 0) + add
-                qty_left -= add
-                remaining_qty[rack] -= add
-                current_weight += add * wt
-                placed_any = True
-
-        if not placed_any:
-            raise ValueError("Some racks cannot physically fit.")
-
+                load[r] = load.get(r, 0) + add
+                remaining[r] -= add
+                qty -= add
+                used_weight += add * wt
+        # =====================================================
+        # ✅ STEP 4: TRUE BACKFILL (UNIT LEVEL)
+        # =====================================================
+        for r in reversed(order):
+            qty = remaining[r]
+            if qty <= 0:
+                continue
+            l = dims[r]["Length (MM)"]
+            w = dims[r]["Width (MM)"]
+            wt = dims[r]["Weight (Kg)"]
+            while qty > 0:
+                if not any(fr.fits(l, w) for fr in bin.free):
+                    break
+                if not bin.place(l, w):
+                    break
+                if used_weight + wt > container["MAX_WT"]:
+                    break
+                load[r] = load.get(r, 0) + 1
+                remaining[r] -= 1
+                qty -= 1
+                used_weight += wt
         containers.append(load)
-
     return containers
-
 # =====================================================
 # TEMPLATE DOWNLOAD
 # =====================================================
 st.subheader("📄 Download Excel Input Template")
-
 template_df = pd.DataFrame(columns=DISPLAY_COLUMNS)
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as w:
     template_df.to_excel(w, index=False)
 buf.seek(0)
-
 st.download_button(
     "⬇️ Download Input Template",
     buf,
     "smartpack_input_template.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
-
 # =====================================================
 # INPUT
 # =====================================================
 st.subheader("📥 Upload Rack Excel or Use Manual Input")
-
 uploaded = st.file_uploader("Upload filled Excel template", type=["xlsx"])
 if uploaded:
     df_input = pd.read_excel(uploaded)
@@ -229,38 +249,29 @@ else:
         }),
         num_rows="dynamic"
     )
-
 container_type = st.selectbox("Container Type", list(CONTAINERS.keys()))
-
 # =====================================================
 # RUN
 # =====================================================
 if st.button("Calculate Loading"):
-
     data = df_input[df_input["Rack / Finished Good"].astype(str).str.strip() != ""]
     if data.empty:
         st.error("No valid rack data.")
         st.stop()
-
     containers = pack_containers_exact(data, CONTAINERS[container_type])
-
     st.subheader("📦 Container-wise Loading Plan")
-
     container_volume = (
         CONTAINERS[container_type]["L"]
         * CONTAINERS[container_type]["W"]
         * CONTAINERS[container_type]["H"]
     )
-
     for i, cont in enumerate(containers, start=1):
         st.write(f"### 🚚 Container {i}")
         st.dataframe(pd.DataFrame(cont.items(),
                                   columns=["Rack / Finished Good", "Quantity"]),
                      use_container_width=True)
-
         total_weight = 0
         total_volume = 0
-
         for rack, qty in cont.items():
             row = data[data["Rack / Finished Good"] == rack].iloc[0]
             total_weight += qty * row["Weight (Kg)"]
@@ -270,19 +281,15 @@ if st.button("Calculate Loading"):
                 * row["Width (MM)"]
                 * row["Height (MM)"]
             )
-
         weight_util = (total_weight / CONTAINERS[container_type]["MAX_WT"]) * 100
         volume_util = (total_volume / container_volume) * 100
-
         st.markdown(
             f"""
             **Weight Used:** {total_weight:.0f} KG ({weight_util:.2f}%)  
             **Volume Utilization:** {volume_util:.2f}%
             """
         )
-
     st.success(f"✅ Total Containers Required: {len(containers)}")
-
     # =================================================
     # DOWNLOAD LOADING PLAN
     # =================================================
@@ -290,17 +297,14 @@ if st.button("Calculate Loading"):
     for i, cont in enumerate(containers, start=1):
         for rack, qty in cont.items():
             export_rows.append([i, rack, qty])
-
     export_df = pd.DataFrame(
         export_rows,
         columns=["Container", "Rack / Finished Good", "Quantity"]
     )
-
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         export_df.to_excel(writer, index=False, sheet_name="Loading Plan")
     output.seek(0)
-
     st.download_button(
         "📥 Download Loading Plan",
         output,
